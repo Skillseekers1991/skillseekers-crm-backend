@@ -1,7 +1,6 @@
 {
   "name": "skillseekers-crm-backend",
   "version": "2.0.0",
-  "description": "Shared backend for the Skill Seekers recruitment CRM (Supabase Postgres)",
   "main": "server.js",
   "type": "commonjs",
   "scripts": { "start": "node server.js" },
