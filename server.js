@@ -1,57 +1,44 @@
 /**
- * Skill Seekers CRM — shared backend (no compiled dependencies)
- * --------------------------------------------------------------
- * One server + one data file that every device talks to, so the
- * whole team shares the same data. Built to deploy cleanly anywhere
- * (no native modules to compile).
- *
- * - Auth: hashed passwords (bcryptjs) + JWT tokens
- * - Storage: a single JSON file (db.json) holding all CRM keys
+ * Skill Seekers CRM — shared backend (Supabase Postgres storage)
  */
-
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
 require('dotenv').config();
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-env';
-const DATA_DIR = process.env.DATA_DIR || (process.env.DB_PATH ? path.dirname(process.env.DB_PATH) : __dirname);
-const DB_FILE = path.join(DATA_DIR, 'db.json');
 const ORIGIN = process.env.CRM_ORIGIN || '*';
+const DATABASE_URL = process.env.DATABASE_URL;
 
-try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
-function readDB() {
-  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
-  catch { return { store: {}, auth: {} }; }
-}
-function writeDB(db) {
-  const tmp = DB_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(db));
-  fs.renameSync(tmp, DB_FILE);
-}
-let DB = readDB();
-function persist() { writeDB(DB); }
-function getKey(key) { return key in DB.store ? DB.store[key] : null; }
-function setKey(key, value) { DB.store[key] = value; persist(); }
-
-function seedAdmin() {
-  if (Object.keys(DB.auth).length === 0) {
-    DB.auth['admin'] = { name: 'Administrator', role: 'admin', hash: bcrypt.hashSync('admin123', 10) };
-    const users = getKey('users') || [];
-    if (!users.find(u => u.id === 'admin')) {
-      users.push({ id: 'admin', name: 'Administrator', role: 'admin', pass: '\u2022\u2022\u2022\u2022\u2022\u2022' });
-      DB.store['users'] = users;
-    }
-    persist();
-    console.log('Seeded default admin: admin / admin123  (change after first login!)');
+async function init() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS store (key TEXT PRIMARY KEY, value JSONB)`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS auth_users (id TEXT PRIMARY KEY, name TEXT, role TEXT, hash TEXT)`);
+  const { rows } = await pool.query('SELECT COUNT(*)::int AS c FROM auth_users');
+  if (rows[0].c === 0) {
+    const hash = bcrypt.hashSync('admin123', 10);
+    await pool.query('INSERT INTO auth_users(id,name,role,hash) VALUES($1,$2,$3,$4)', ['admin','Administrator','admin',hash]);
+    const users = [{ id:'admin', name:'Administrator', role:'admin', pass:'••••••' }];
+    await pool.query(`INSERT INTO store(key,value) VALUES('users',$1) ON CONFLICT(key) DO NOTHING`, [JSON.stringify(users)]);
+    console.log('Seeded default admin: admin / admin123');
   }
+  console.log('Database ready.');
 }
-seedAdmin();
+
+async function getKey(key) {
+  const { rows } = await pool.query('SELECT value FROM store WHERE key=$1', [key]);
+  return rows.length ? rows[0].value : null;
+}
+async function setKey(key, value) {
+  await pool.query(`INSERT INTO store(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, [key, JSON.stringify(value)]);
+}
 
 const app = express();
 app.use(cors({ origin: ORIGIN }));
@@ -65,46 +52,49 @@ function auth(req, res, next) {
   catch { res.status(401).json({ error: 'Invalid token' }); }
 }
 
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
-
-app.post('/api/login', (req, res) => {
-  const { id, pass } = req.body || {};
-  const u = DB.auth[String(id || '').trim()];
-  if (!u || !bcrypt.compareSync(String(pass || ''), u.hash)) {
-    return res.status(401).json({ error: 'Wrong login ID or password' });
-  }
-  const token = jwt.sign({ id: String(id).trim(), name: u.name, role: u.role }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ token, user: { id: String(id).trim(), name: u.name, role: u.role } });
+app.get('/api/health', async (_req, res) => {
+  try { await pool.query('SELECT 1'); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ ok: false, error: String(e.message) }); }
 });
 
-app.get('/api/data/:key', auth, (req, res) => {
-  res.json({ value: getKey(req.params.key) });
+app.post('/api/login', async (req, res) => {
+  try {
+    const { id, pass } = req.body || {};
+    const { rows } = await pool.query('SELECT * FROM auth_users WHERE id=$1', [String(id || '').trim()]);
+    const u = rows[0];
+    if (!u || !bcrypt.compareSync(String(pass || ''), u.hash)) return res.status(401).json({ error: 'Wrong login ID or password' });
+    const token = jwt.sign({ id:u.id, name:u.name, role:u.role }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, user: { id:u.id, name:u.name, role:u.role } });
+  } catch (e) { res.status(500).json({ error: String(e.message) }); }
 });
 
-app.put('/api/data/:key', auth, (req, res) => {
-  const key = req.params.key;
-  const value = req.body.value;
-  if (key === 'users' && !['admin', 'leader'].includes(req.user.role)) {
-    return res.status(403).json({ error: 'Not allowed' });
-  }
-  setKey(key, value);
-  if (key === 'users' && Array.isArray(value)) syncAuthUsers(value);
-  res.json({ ok: true });
+app.get('/api/data/:key', auth, async (req, res) => {
+  try { res.json({ value: await getKey(req.params.key) }); }
+  catch (e) { res.status(500).json({ error: String(e.message) }); }
 });
 
-function syncAuthUsers(users) {
+app.put('/api/data/:key', auth, async (req, res) => {
+  try {
+    const key = req.params.key, value = req.body.value;
+    if (key === 'users' && !['admin','leader'].includes(req.user.role)) return res.status(403).json({ error: 'Not allowed' });
+    await setKey(key, value);
+    if (key === 'users' && Array.isArray(value)) await syncAuthUsers(value);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: String(e.message) }); }
+});
+
+async function syncAuthUsers(users) {
+  const { rows } = await pool.query('SELECT id, hash FROM auth_users');
+  const byId = Object.fromEntries(rows.map(r => [r.id, r]));
   const seen = new Set();
-  users.forEach(u => {
+  for (const u of users) {
     seen.add(u.id);
-    const sentPass = u.pass && u.pass !== '\u2022\u2022\u2022\u2022\u2022\u2022' ? u.pass : null;
-    const existing = DB.auth[u.id];
-    const hash = sentPass ? bcrypt.hashSync(String(sentPass), 10)
-                          : (existing ? existing.hash : bcrypt.hashSync('changeme', 10));
-    DB.auth[u.id] = { name: u.name || '', role: u.role || 'recruiter', hash };
-  });
-  Object.keys(DB.auth).forEach(id => { if (!seen.has(id)) delete DB.auth[id]; });
-  persist();
+    const sentPass = u.pass && u.pass !== '••••••' ? u.pass : null;
+    const hash = sentPass ? bcrypt.hashSync(String(sentPass), 10) : (byId[u.id] ? byId[u.id].hash : bcrypt.hashSync('changeme', 10));
+    await pool.query(`INSERT INTO auth_users(id,name,role,hash) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET name=excluded.name, role=excluded.role, hash=excluded.hash`, [u.id, u.name || '', u.role || 'recruiter', hash]);
+  }
+  for (const r of rows) { if (!seen.has(r.id)) await pool.query('DELETE FROM auth_users WHERE id=$1', [r.id]); }
 }
 
-app.get('/', (_req, res) => res.send('Skill Seekers CRM backend is running.'));
-app.listen(PORT, () => console.log(`CRM backend listening on :${PORT}`));
+app.get('/', (_req, res) => res.send('Skill Seekers CRM backend (Supabase) is running.'));
+init().then(() => app.listen(PORT, () => console.log(`CRM backend listening on :${PORT}`))).catch(err => { console.error('Startup failed:', err); process.exit(1); });
